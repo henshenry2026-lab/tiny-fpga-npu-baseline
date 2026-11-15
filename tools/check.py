@@ -15,7 +15,7 @@ from npu_stream import (write_cases as write_stream_cases, estimate_tile_memory,
                         estimate_gemm_schedule, estimate_mlp_schedule, parameter_sweep)
 from hdl_tools import find_tool
 from npu_mapper import export_bundle
-from npu_mapper_sim import simulate_bundle
+from npu_mapper_sim import simulate_bundle, simulate_gemv_model_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
@@ -190,7 +190,7 @@ def gemv_acceptance(resources, measurements):
 
 
 def check_gemv(yosys, sources, stream_resources, models):
-    """Synthesize the vector tops and compare both dataflows on identical models."""
+    """Synthesize vector tops and validate single-layer and buffered model paths."""
     resources = {"stream_linear_2": stream_resources["stream_linear_2"]["mapped"]}
     for lanes in (1, 2, 4):
         for kind in ("raw", "linear"):
@@ -205,6 +205,19 @@ def check_gemv(yosys, sources, stream_resources, models):
             resources[name] = resource_summary(top, BUILD/f"{name}.json")
             resources[name]["accumulator_payload_bytes"] = 4*lanes
             print(f"PASS {name}: {resources[name]}", flush=True)
+    model_top = "npu_gemv_model_top"
+    model_name = "gemv_model_l2"
+    model_script = ("read_verilog -sv " + " ".join(sources)
+                    + f"; chparam -set LANES 2 -set MAX_FEATURES 64 {model_top};"
+                    + f" hierarchy -check -top {model_top}; synth_xilinx -family xc7 -top {model_top};"
+                    + f" check -assert; stat; write_json build/{model_name}.json")
+    run("NPU GEMV buffered model synthesis", [yosys, "-Q", "-T", "-p", model_script],
+        "npu-gemv-model-synthesis.log", timeout=300)
+    model_resources = resource_summary(model_top, BUILD/f"{model_name}.json")
+    if (model_resources["dsp48e1"] != 6 or model_resources["ramb18e1"]
+            or model_resources["ramb36e1"] or not model_resources["distributed_ram_primitives"]):
+        raise RuntimeError(f"Unexpected buffered GEMV resources: {model_resources}")
+    print(f"PASS {model_name}: {model_resources}", flush=True)
     measurements = {}
     for case, source, inputs in models:
         for stalls in (False, True):
@@ -218,6 +231,16 @@ def check_gemv(yosys, sources, stream_resources, models):
                 cycles = sum(layer["rtl"]["cycles"] for layer in measured["layers"])
                 print(f"PASS {name}: {cycles} busy cycles, {measured['operand_stream_bytes']} operand bytes", flush=True)
     summary = gemv_acceptance(resources, measurements)
+    model_runs = {}
+    for (case, source, inputs), stalls in zip(models, (False, True)):
+        folder = BUILD/"gemv"/"model-runner"/case
+        export_bundle(source, inputs, folder, lanes=2, backend="gemv")
+        checked = simulate_gemv_model_bundle(folder, stalls=stalls)
+        model_runs[case] = checked["rtl_validation"]["model_runner"]
+        print(f"PASS model runner {case}: {model_runs[case]}", flush=True)
+    summary["model_runner"] = {"resources": model_resources, "simulations": model_runs,
+                               "default_activation_capacity": 64,
+                               "activation_buffer_payload_bytes": 128}
     (BUILD/"npu-gemv-summary.json").write_text(json.dumps(summary, indent=2)+"\n", encoding="utf-8")
     return summary
 

@@ -97,7 +97,8 @@ class GemvTests(unittest.TestCase):
             self.assertEqual(params, [["0", "0"], ["0", "1"], ["0", "2"], ["0", "0"]])
             self.assertEqual(report, json.loads((root / "report.json").read_text()))
             mapper.export_bundle(tiny_model(), [[1, -1]], root / "again", 2, backend="gemv")
-            for name in ("mapped-model.json", "operands.txt", "parameters.txt", "jobs.txt", "expected.txt", "inputs.txt", "report.json"):
+            for name in ("mapped-model.json", "operands.txt", "model-weights.txt", "parameters.txt",
+                         "jobs.txt", "expected.txt", "inputs.txt", "report.json"):
                 self.assertEqual((root / name).read_bytes(), (root / "again" / name).read_bytes())
 
     def test_cli_backend_and_k_tile_validation_clear_prior_report(self):
@@ -237,7 +238,9 @@ class GemvTests(unittest.TestCase):
                 str(root / "model.json"), "--inputs", str(root / "input.json"), "--output-dir", str(root / "out"),
                 "--backend", "gemv", "--simulate"], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads((root / "out/report.json").read_text())["rtl_validation"]["status"], "passed")
+            validation = json.loads((root / "out/report.json").read_text())["rtl_validation"]
+            self.assertEqual(validation["status"], "passed")
+            self.assertEqual(validation["model_runner"]["status"], "passed")
             for name in ("jobs.txt", "inputs.txt", "operands.txt", "parameters.txt", "expected.txt"):
                 with self.subTest(stream=name):
                     mapper.export_bundle(tiny_model(), [[1, -1]], root / "out", 2, backend="gemv")

@@ -181,3 +181,66 @@ def simulate_bundle(output_dir, stalls=True):
             report_path.unlink(missing_ok=True)
         raise RuntimeError(message) from error
     return report
+
+
+def simulate_gemv_model_bundle(output_dir, stalls=True, max_features=64):
+    """Run a complete batch-one GEMV model through the on-chip activation buffers."""
+    root = Path(output_dir).resolve()
+    report_path = root/"report.json"
+    report = None
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if not isinstance(report, dict):
+            raise ValueError("report root must be an object")
+        report["rtl_validation"] = report.get("rtl_validation", {})
+        report["rtl_validation"]["status"] = "running"
+        report["rtl_validation"]["model_runner"] = {"status": "running", "stalls": bool(stalls)}
+        write_json(report_path, report)
+        _validate_report(report)
+        if report.get("backend") != "gemv" or report.get("batch") != 1:
+            raise ValueError("model runner requires batch-one GEMV")
+        if type(max_features) is not int or not 1 <= max_features <= 256:
+            raise ValueError("activation capacity must be in 1..256")
+        if any(layer["shape"][dimension] > max_features
+               for layer in report["layers"] for dimension in ("n", "k")):
+            raise RuntimeError(f"model input/output width exceeds activation capacity {max_features}")
+        iverilog, vvp = find_tool("iverilog"), find_tool("vvp")
+        sources = sorted(str(path) for path in (ROOT/"rtl/npu").glob("*")
+                         if path.suffix in (".v", ".sv"))
+        lanes = report["lanes"]
+        _run([iverilog, "-g2012", "-Wall", "-s", "tb_npu_gemv_model",
+              f"-Ptb_npu_gemv_model.LANES={lanes}",
+              f"-Ptb_npu_gemv_model.MAX_FEATURES={max_features}",
+              f"-Ptb_npu_gemv_model.STALLS={int(bool(stalls))}",
+              "-o", str(root/"gemv-model.vvp"), *sources,
+              str(ROOT/"tests/npu/tb_npu_gemv_model.sv")], root, "model-compile.log")
+        _run([vvp, str(root/"gemv-model.vvp"), f"+BUNDLE={root.as_posix()}"],
+             root, "model-simulation.log")
+        try:
+            output = [int(token, 10) for token in
+                      (root/"rtl-model-results.txt").read_text(encoding="ascii").split()]
+        except ValueError as error:
+            raise RuntimeError("malformed model RTL result") from error
+        expected = report["layers"][-1]["int8_output"][0]
+        if output != expected:
+            raise RuntimeError("model RTL final output differs from the mapped integer reference")
+        report["rtl_validation"]["model_runner"] = {
+            "status": "passed", "stalls": bool(stalls), "layers": len(report["layers"]),
+            "max_features": max_features, "activation_buffer_bytes": 2*max_features,
+            "intermediate_outputs_hosted": 0, "integer_mismatches": 0}
+        report["rtl_validation"]["status"] = "passed"
+        write_json(report_path, report)
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError, IndexError, ArithmeticError) as error:
+        message = str(error) if isinstance(error, RuntimeError) else f"invalid model bundle: {error}"
+        if isinstance(report, dict):
+            report.setdefault("rtl_validation", {})["status"] = "failed"
+            report.setdefault("rtl_validation", {})["model_runner"] = {
+                "status": "failed", "stalls": bool(stalls), "error": message}
+            try:
+                write_json(report_path, report)
+            except (OSError, ValueError, TypeError):
+                report_path.unlink(missing_ok=True)
+        else:
+            report_path.unlink(missing_ok=True)
+        raise RuntimeError(message) from error
+    return report

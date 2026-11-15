@@ -243,6 +243,7 @@ def export_bundle(model, samples, output_dir, lanes=4, k_tile=None, backend="gem
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     (root/"report.json").unlink(missing_ok=True)
+    (root/"model-weights.txt").unlink(missing_ok=True)
     plan = map_model(model, samples, lanes, k_tile, backend)
     compiled, traces, report = plan["compiled"], plan["layers"], plan["report"]
     with (root/"jobs.txt").open("w", encoding="ascii", newline="\n") as jobs, \
@@ -266,6 +267,11 @@ def export_bundle(model, samples, output_dir, lanes=4, k_tile=None, backend="gem
             for row in output:
                 expected.write(" ".join(map(str, row))+"\n")
     (root/"inputs.txt").write_text("\n".join(" ".join(map(str, row)) for row in traces[0]["inputs"])+"\n", encoding="ascii")
+    if backend == "gemv":
+        with (root/"model-weights.txt").open("w", encoding="ascii", newline="\n") as model_weights:
+            for layer, trace in zip(compiled["layers"], traces):
+                for _, packed_weights in operand_beats(trace["inputs"], layer["weights"], lanes):
+                    model_weights.write(f"{_packed(packed_weights):0{2*lanes}x}\n")
     write_json(root/"mapped-model.json", compiled)
     write_json(root/"report.json", report)
     return report
@@ -288,8 +294,10 @@ def main():
         inputs = json.loads(args.inputs.read_text(encoding="utf-8"))
         report = export_bundle(source, inputs, args.output_dir, args.lanes, args.k_tile, args.backend)
         if args.simulate:
-            from npu_mapper_sim import simulate_bundle
+            from npu_mapper_sim import simulate_bundle, simulate_gemv_model_bundle
             report = simulate_bundle(args.output_dir)
+            if args.backend == "gemv":
+                report = simulate_gemv_model_bundle(args.output_dir)
         print(json.dumps({"report": str(args.output_dir/"report.json"),
               "layers": len(report["layers"]), "MAC_count": report["MAC_count"],
               "host_activation_peak_bytes": report["host_activation_peak_bytes"],
